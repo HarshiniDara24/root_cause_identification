@@ -7,4 +7,6 @@ sentence-transformers
 uvicorn
 fastapi
 pandas
+markdown2
+
 
