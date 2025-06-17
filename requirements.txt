@@ -7,6 +7,12 @@ sentence-transformers
 uvicorn
 fastapi
 pandas
+numpy
 markdown2
+pydantic
+httpx
+requests
+python-docx
+bleach
 
 
