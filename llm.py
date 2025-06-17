@@ -12,7 +12,7 @@ import markdown2
 
 class DataBase:
     def __init__(self):
-        self.client = self._initialize_db()c
+        self.client = self._initialize_db()
         self.defect_data = self._load_defect_data()
 
     def _initialize_db(self) -> MongoClient:
