@@ -353,17 +353,22 @@ async def proxy_uvrules(request: UVRuleRequest):
         )
     })
  
-@app.get("/servicenow/incidents")
-async def get_servicenow_incidents_route():
-    try:
-        data = await fetch_servicenow_incidents()
-        return JSONResponse(content=data)
-    except RuntimeError as e:
-        return JSONResponse(content={"error": str(e)}, status_code=502)
+# @app.get("/servicenow/incidents")
+# async def get_servicenow_incidents_route():
+#     try:
+#         data = await fetch_servicenow_incidents()
+#         return JSONResponse(content=data)
+#     except RuntimeError as e:
+#         return JSONResponse(content={"error": str(e)}, status_code=502)
+
+@app.get("/")
+async def root():
+    return {"message": "Root Cause Identification API is running."}
+
  
 if __name__ == "__main__":
     try:
         port = int(os.environ.get("PORT", 8000))  # Render will set PORT env; fallback 8000 locally
-        uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
+        uvicorn.run("app:app", host="0.0.0.0", port=port)
     except KeyboardInterrupt:
         cleanup_resources()
