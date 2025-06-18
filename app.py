@@ -209,45 +209,59 @@
 #         cleanup_resources()
 
 
-
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from pathlib import Path
-from dotenv import load_dotenv
-from contextlib import asynccontextmanager
-import os
-import signal
-import bleach
-import uvicorn
-import gc
- 
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, HTMLResponse
 from llm import FAISS, DataBase, LLM
+from contextlib import asynccontextmanager
+from pathlib import Path
+import os
+from dotenv import load_dotenv
+import uvicorn
+from pydantic import BaseModel
 from jira_data_loader import load_data_from_jira
-# from servicenow import fetch_servicenow_incidents
+from fastapi.middleware.cors import CORSMiddleware
+import signal
+import markdown2
+import bleach  # Add this import
  
-# Global state
 defects_llm = {}
-valid_defect_ids = set()
 cleanup_done = False
+valid_defect_ids = set()  # Will be populated during startup
+
+ 
  
 def cleanup_resources():
     global cleanup_done
     if not cleanup_done:
-        defects_llm.clear()
-        gc.collect()
+        if defects_llm:
+            defects_llm.clear()
         cleanup_done = True
-        print("Resources cleaned up.")
  
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    BASE_DIR = Path(__file__).absolute().parent
-    ENV_PATH = os.path.join(BASE_DIR, ".env")
-    load_dotenv(ENV_PATH)
-    print("App started. Data not loaded yet. Call /defects/load to load data.")
-    yield
-    cleanup_resources()
+    try:
+        BASE_DIR = Path(__file__).absolute().parent
+        ENV_PATH = os.path.join(BASE_DIR, ".env")
+        load_dotenv(ENV_PATH)
+        load_data_from_jira()
+       
+        vs = FAISS.initialize()
+        db = DataBase()
+        faiss_data = vs.add_documents(db)
+        defects_llm.update(faiss_data)
+       
+        # Get valid defect IDs from database
+        global valid_defect_ids
+        valid_defect_ids = {d['bug_id'] for d in db.defect_data}
+        print(f"Loaded valid defect IDs: {valid_defect_ids}")
+       
+        yield
+    except Exception as e:
+        print(f"Error during startup: {e}")
+        cleanup_resources()
+        raise
+    finally:
+        cleanup_resources()
  
 def handle_exit(signum, frame):
     cleanup_resources()
@@ -256,7 +270,7 @@ def handle_exit(signum, frame):
 signal.signal(signal.SIGINT, handle_exit)
 signal.signal(signal.SIGTERM, handle_exit)
  
-app = FastAPI(lifespan=lifespan)
+app  = FastAPI(lifespan=lifespan)
  
 app.add_middleware(
     CORSMiddleware,
@@ -270,29 +284,16 @@ class ChatRequest(BaseModel):
     prompt: str
     conversation_id: str = None
  
-class UVRuleRequest(BaseModel):
-    user_request: str
- 
-@app.post("/defects/load")
-async def load_defects():
-    global valid_defect_ids
-    load_data_from_jira()
-    vs = FAISS.initialize()
-    db = DataBase()
-    faiss_data = vs.add_documents(db)
-    defects_llm.update(faiss_data)
-    valid_defect_ids = {d['bug_id'] for d in db.defect_data}
-    return {"message": "Defects loaded successfully.", "valid_ids": list(valid_defect_ids)}
- 
 @app.post("/defects/response")
 async def defects_response(chat_request: ChatRequest):
     llm = LLM()
     query = chat_request.prompt.lower()
     db = DataBase()
- 
-    mentioned_ids = {word.upper() for word in query.split() if word.upper().startswith('SCRUM-')}
+   
+    # Check if query mentions invalid defect IDs using dynamic set
+    mentioned_ids = set([word.upper() for word in query.split() if word.upper().startswith('SCRUM-')])
     invalid_ids = mentioned_ids - valid_defect_ids
- 
+   
     if invalid_ids:
         return JSONResponse(content={
             "response": {
@@ -312,19 +313,28 @@ Please check the list of active defects above and try your query with a valid de
         })
  
     vs = FAISS.initialize()
-    vs.defect_embeddings = defects_llm.get("index")
+    vs.defect_embeddings = defects_llm["index"]
+   
+    # Initialize relevant_defects with all defects as default
     relevant_defects = db.defect_data
  
+    # Special handling for root cause and solution queries
     if any(keyword in query for keyword in ['root', 'cause', 'why', 'solution', 'fix', 'resolve']):
-        if mentioned_ids:
-            relevant_defects = [d for d in db.defect_data if d['bug_id'] in mentioned_ids]
+        mentioned_ids = [word.upper() for word in query.split() if word.upper().startswith('SCRUM-')]
+        if mentioned_ids and mentioned_ids[0] in valid_defect_ids:
+            # Get the specific defect directly from database
+            relevant_defects = [d for d in db.defect_data if d['bug_id'] == mentioned_ids[0]]
+            # Add debug logging
+            print(f"Found defect details: {relevant_defects[0] if relevant_defects else 'Not found'}")
     elif not any(keyword in query for keyword in ['owner', 'who', 'list', 'all defect']):
+        # For specific queries that aren't about listing all defects
         relevant_indices_scores = vs.semantic_search(query, top_k=10)
         relevant_defects = db.get_defects_by_indices_with_scores(relevant_indices_scores)
         relevant_defects.sort(key=lambda x: x['relevance_score'], reverse=True)
- 
+   
     response = llm.get_response(query, relevant_defects)
- 
+   
+    # Only sanitize if content type is HTML
     if response.get("content_type") == "html":
         allowed_tags = ['a', 'p', 'br', 'li', 'ul', 'ol', 'table', 'tr', 'td', 'th', 'thead', 'tbody']
         allowed_attrs = {'a': ['href', 'target']}
@@ -334,41 +344,58 @@ Please check the list of active defects above and try your query with a valid de
             attributes=allowed_attrs,
             protocols=['http', 'https']
         )
+   
+    return JSONResponse(
+        content={"response": response},
+        headers={"Content-Type": "application/json"}
+    )
  
-    return JSONResponse(content={"response": response})
+class UVRuleRequest(BaseModel):
+    user_request: str
  
 @app.post("/proxy/uvrules")
 async def proxy_uvrules(request: UVRuleRequest):
+    """Proxy endpoint for UV Rules service"""
     if not request.user_request.strip():
         return JSONResponse(content={
             "message": "Please provide a policy number and rule code (e.g., E101)."
         })
-    return JSONResponse(content={
-        "message": (
-            "I understand you're asking about UV rules. "
-            "To help you better, please provide:\n"
-            "1. Policy Number\n"
-            "2. Rule Code (e.g., E101)\n\n"
-            "For example: 'Why is rule E101 triggered for policy 12345?'"
-        )
-    })
  
-# @app.get("/servicenow/incidents")
-# async def get_servicenow_incidents_route():
-#     try:
-#         data = await fetch_servicenow_incidents()
-#         return JSONResponse(content=data)
-#     except RuntimeError as e:
-#         return JSONResponse(content={"error": str(e)}, status_code=502)
-
-@app.get("/")
-async def root():
-    return {"message": "Root Cause Identification API is running."}
-
+    try:
+        # For now, return a mock response until UV Rules service is available
+        return JSONResponse(content={
+            "message": "I understand you're asking about UV rules. " +
+                      "To help you better, please provide:\n" +
+                      "1. Policy Number\n" +
+                      "2. Rule Code (e.g., E101)\n\n" +
+                      "For example: 'Why is rule E101 triggered for policy 12345?'"
+        })
+    except Exception as e:
+        return JSONResponse(
+            content={
+                "message": f"Error processing UV rule request: {str(e)}"
+            },
+            status_code=500
+        )
+       
+ 
+ 
+@app.get("/servicenow/incidents")
+async def get_servicenow_incidents_route():
+    try:
+        data = await fetch_defects()
+        return JSONResponse(content=data)
+    except RuntimeError as e:
+        return JSONResponse(
+            content={"error": str(e)},
+            status_code=502
+        )
+ 
+ 
+ 
  
 if __name__ == "__main__":
     try:
-        port = int(os.environ.get("PORT", 8000))  # Render will set PORT env; fallback 8000 locally
-        uvicorn.run("app:app", host="0.0.0.0", port=port)
+        uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
     except KeyboardInterrupt:
         cleanup_resources()
