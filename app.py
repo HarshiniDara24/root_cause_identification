@@ -225,7 +225,7 @@ import gc
  
 from llm import FAISS, DataBase, LLM
 from jira_data_loader import load_data_from_jira
-from servicenow import fetch_servicenow_incidents
+# from servicenow import fetch_servicenow_incidents
  
 # Global state
 defects_llm = {}
