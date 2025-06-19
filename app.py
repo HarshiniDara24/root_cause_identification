@@ -274,7 +274,7 @@ app  = FastAPI(lifespan=lifespan)
  
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://frontend-final-tyl9.onrender.com"],
+    allow_origins=["https://bugbusters-ty6v.onrender.com/"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -391,7 +391,10 @@ async def get_servicenow_incidents_route():
             status_code=502
         )
  
- 
+@app.get("/")
+async def root():
+    return JSONResponse(content={"message": "✅ Backend is running!"})
+
  
  
 if __name__ == "__main__":
